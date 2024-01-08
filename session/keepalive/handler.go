@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/vmware/govmomi/vapi/rest"
@@ -30,9 +29,7 @@ import (
 
 // handler contains the generic keep alive settings and logic
 type handler struct {
-	mu              sync.Mutex
-	notifyStop      chan struct{}
-	notifyWaitGroup sync.WaitGroup
+	notifyStop chan struct{}
 
 	idle time.Duration
 	send func() error
@@ -44,8 +41,9 @@ type handler struct {
 // The keep alive goroutine starts when a Login method is called and runs until Logout is called or send returns an error.
 func NewHandlerSOAP(c soap.RoundTripper, idle time.Duration, send func() error) *HandlerSOAP {
 	h := &handler{
-		idle: idle,
-		send: send,
+		idle:       idle,
+		send:       send,
+		notifyStop: make(chan struct{}, 1),
 	}
 
 	if send == nil {
@@ -63,8 +61,9 @@ func NewHandlerSOAP(c soap.RoundTripper, idle time.Duration, send func() error) 
 // The keep alive goroutine starts when a Login method is called and runs until Logout is called or send returns an error.
 func NewHandlerREST(c *rest.Client, idle time.Duration, send func() error) *HandlerREST {
 	h := &handler{
-		idle: idle,
-		send: send,
+		idle:       idle,
+		send:       send,
+		notifyStop: make(chan struct{}, 1), // Defining channel as "1" will make its nature async, so it will give chance for the rest of "logout" to run
 	}
 
 	if send == nil {
@@ -98,51 +97,33 @@ func (h *handler) keepAliveREST(c *rest.Client) error {
 // Start explicitly starts the keep alive go routine.
 // For use with session cache.Client, as cached sessions may not involve Login/Logout via RoundTripper.
 func (h *handler) Start() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if h.notifyStop != nil {
-		return
-	}
-
 	if h.idle == 0 {
 		h.idle = time.Minute * 10
 	}
 
-	// This channel must be closed to terminate idle timer.
-	h.notifyStop = make(chan struct{})
-	h.notifyWaitGroup.Add(1)
-
+	t := time.NewTimer(h.idle)
 	go func() {
-		for t := time.NewTimer(h.idle); ; {
+		for {
 			select {
-			case <-h.notifyStop:
-				h.notifyWaitGroup.Done()
-				t.Stop()
-				return
 			case <-t.C:
 				if err := h.send(); err != nil {
-					h.notifyWaitGroup.Done()
-					h.Stop()
-					return
+					t.Stop()
+					h.notifyStop <- struct{}{}
+					continue
 				}
 				t.Reset(h.idle)
+			case _, ok := <-h.notifyStop:
+				if !ok {
+					h.notifyStop = nil
+					return
+				}
+				t.Stop()
+				close(h.notifyStop)
+				h.notifyStop = nil
+				return
 			}
 		}
 	}()
-}
-
-// Stop explicitly stops the keep alive go routine.
-// For use with session cache.Client, as cached sessions may not involve Login/Logout via RoundTripper.
-func (h *handler) Stop() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if h.notifyStop != nil {
-		close(h.notifyStop)
-		h.notifyWaitGroup.Wait()
-		h.notifyStop = nil
-	}
 }
 
 // HandlerSOAP is a keep alive implementation for use with vim25.Client
@@ -157,7 +138,10 @@ func (h *HandlerSOAP) RoundTrip(ctx context.Context, req, res soap.HasFault) err
 	// Stop ticker on logout.
 	switch req.(type) {
 	case *methods.LogoutBody:
-		h.Stop()
+		// If the channel is empty, we can send our stop message as it won't block
+		if h.notifyStop != nil && len(h.notifyStop) == 0 {
+			h.notifyStop <- struct{}{}
+		}
 	}
 
 	err := h.roundTripper.RoundTrip(ctx, req, res)
@@ -187,8 +171,9 @@ func (h *HandlerREST) RoundTrip(req *http.Request) (*http.Response, error) {
 		return h.roundTripper.RoundTrip(req)
 	}
 
-	if req.Method == http.MethodDelete { // Logout
-		h.Stop()
+	// If the channel is empty, we can send our stop message as it won't block
+	if req.Method == http.MethodDelete && h.notifyStop != nil && len(h.notifyStop) == 0 { // Logout
+		h.notifyStop <- struct{}{}
 	}
 
 	res, err := h.roundTripper.RoundTrip(req)
