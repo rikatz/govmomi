@@ -30,9 +30,9 @@ import (
 
 // handler contains the generic keep alive settings and logic
 type handler struct {
-	mu              sync.Mutex
-	notifyStop      chan struct{}
-	notifyWaitGroup sync.WaitGroup
+	startOnce sync.Once
+	stopOnce  sync.Once
+	stopFunc  func()
 
 	idle time.Duration
 	send func() error
@@ -98,50 +98,53 @@ func (h *handler) keepAliveREST(c *rest.Client) error {
 // Start explicitly starts the keep alive go routine.
 // For use with session cache.Client, as cached sessions may not involve Login/Logout via RoundTripper.
 func (h *handler) Start() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.startOnce.Do(h.start)
+}
 
-	if h.notifyStop != nil {
-		return
-	}
-
+// start is the private method for starting the goroutine. It should be called just once
+func (h *handler) start() {
 	if h.idle == 0 {
 		h.idle = time.Minute * 10
 	}
 
-	// This channel must be closed to terminate idle timer.
-	h.notifyStop = make(chan struct{})
-	h.notifyWaitGroup.Add(1)
+	notifyStop := make(chan struct{})
+
+	h.stopFunc = func() {
+		if notifyStop != nil {
+			notifyStop <- struct{}{}
+		}
+	}
 
 	go func() {
-		for t := time.NewTimer(h.idle); ; {
-			select {
-			case <-h.notifyStop:
-				h.notifyWaitGroup.Done()
-				t.Stop()
-				return
-			case <-t.C:
-				if err := h.send(); err != nil {
-					h.notifyWaitGroup.Done()
-					h.Stop()
-					return
-				}
-				t.Reset(h.idle)
-			}
-		}
+		h.handlerStart(notifyStop)
+		close(notifyStop)
 	}()
+}
+
+// handlerStart isolates the ticker and stopChannel. It will be used to stop the routine
+// in case of a signal received on stop channel, or in case of some error on the ticker.
+func (h *handler) handlerStart(stopCh <-chan struct{}) {
+	t := time.NewTimer(h.idle)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-t.C:
+			if err := h.send(); err != nil {
+				return
+			}
+			t.Reset(h.idle)
+		}
+	}
 }
 
 // Stop explicitly stops the keep alive go routine.
 // For use with session cache.Client, as cached sessions may not involve Login/Logout via RoundTripper.
 func (h *handler) Stop() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if h.notifyStop != nil {
-		close(h.notifyStop)
-		h.notifyWaitGroup.Wait()
-		h.notifyStop = nil
+	if h.stopFunc != nil {
+		h.stopOnce.Do(h.stopFunc)
 	}
 }
 
