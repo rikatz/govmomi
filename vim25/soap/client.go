@@ -778,6 +778,12 @@ func (c *Client) soapRoundTrip(ctx context.Context, reqBody, resBody HasFault) e
 			// OK
 		case http.StatusInternalServerError:
 			// Error, but typically includes a body explaining the error
+		case http.StatusTemporaryRedirect:
+			c.u, err = url.Parse(res.Header["Location"][0])
+			if err != nil {
+				return newStatusError(res)
+			}
+			return c.soapRoundTrip(ctx, reqBody, resBody)
 		default:
 			return newStatusError(res)
 		}
